@@ -5,6 +5,8 @@ import os
 from math import floor, sqrt
 import json
 from pathlib import Path
+from typing import NamedTuple
+import numpy as np
 
 import numpy as np
 from einops import rearrange
@@ -51,6 +53,8 @@ class RedGymEnv(Env):
         self.s_path.mkdir(exist_ok=True)
         self.reset_count = 0
         self.all_runs = []
+        self.epsilon_greedy_flag = False
+        self.epsilon = 1.0
 
         # Set this in SOME subclasses
         self.metadata = {"render.modes": []}
@@ -158,8 +162,18 @@ class RedGymEnv(Env):
         self.progress_reward = self.get_game_state_reward()
         self.total_reward = sum([val for _, val in self.progress_reward.items()])
         self.reset_count += 1
-        return self.render(), {}
+        self.epsilon_greedy_flag = False
+        self.epsilon = 1.0
+        return self.render(), self.progress_reward
     
+    def save_state(self,filename):
+        with open(filename, "wb") as f:
+            self.pyboy.save_state(f)
+
+    def set_epsilon(self, epsilon):
+        self.epsilon_greedy_flag = True
+        self.epsilon = epsilon
+
     def init_knn(self):
         # Declaring index
         self.knn_index = hnswlib.Index(space='l2', dim=self.vec_dim) # possible options are l2, cosine or ip
@@ -192,6 +206,9 @@ class RedGymEnv(Env):
         return game_pixels_render
     
     def step(self, action):
+        if self.epsilon_greedy_flag:
+            if np.random.rand() < self.epsilon:
+                action = self.action_space.sample()
 
         self.run_action_on_emulator(action)
         self.append_agent_stats(action)
@@ -228,7 +245,9 @@ class RedGymEnv(Env):
 
         self.step_count += 1
 
-        return obs_memory, new_reward*0.1, False, step_limit_reached, {}
+        step_info = self.progress_reward
+
+        return obs_memory, new_reward*0.1, False, step_limit_reached, step_info
 
     def run_action_on_emulator(self, action):
         # press button then release after some steps
@@ -318,13 +337,18 @@ class RedGymEnv(Env):
     def update_reward(self):
         # compute reward
         old_prog = self.group_rewards()
+        old_rewards = self.progress_reward
         self.progress_reward = self.get_game_state_reward()
         new_prog = self.group_rewards()
         new_total = sum([val for _, val in self.progress_reward.items()]) #sqrt(self.explore_reward * self.progress_reward)
         new_step = new_total - self.total_reward
-        if new_step < 0 and self.read_hp_fraction() > 0:
+        #if new_step < 0 and self.read_hp_fraction() > 0:
             #print(f'\n\nreward went down! {self.progress_reward}\n\n')
-            self.save_screenshot('neg_reward')
+            #self.save_screenshot('neg_reward')
+        # is_stucked = (old_rewards["explore"] == self.progress_reward["explore"]) and (abs(old_rewards["battle_adv"]) +abs(self.progress_reward["battle_adv"])==0)
+        # if is_stucked:
+        #     print(f'\n\nstucked! {self.progress_reward}\n\n')
+        #     self.save_screenshot('stucked')
     
         self.total_reward = new_total
         return (new_step, 
@@ -423,8 +447,8 @@ class RedGymEnv(Env):
 
         if done:
             self.all_runs.append(self.progress_reward)
-            with open(self.s_path / Path(f'all_runs_{self.instance_id}.json'), 'w') as f:
-                json.dump(self.all_runs, f)
+            # with open(self.s_path / Path(f'all_runs_{self.instance_id}.json'), 'w') as f:
+            #     json.dump(self.all_runs, f)
             pd.DataFrame(self.agent_stats).to_csv(
                 self.s_path / Path(f'agent_stats_{self.instance_id}.csv.gz'), compression='gzip', mode='a')
     
@@ -473,8 +497,9 @@ class RedGymEnv(Env):
             if self.last_health > 0:
                 heal_amount = cur_health - self.last_health
                 if heal_amount > 0.5:
-                    print(f'healed: {heal_amount}')
-                    self.save_screenshot('healing')
+                    #print(f'healed: {heal_amount}')
+                    #self.save_screenshot('healing')
+                    pass
                 self.total_healing_rew += heal_amount * 4
             else:
                 self.died_count += 1
@@ -521,19 +546,29 @@ class RedGymEnv(Env):
             print(f'seen_poke_count : {seen_poke_count}')
             print(f'oak_parcel: {oak_parcel} oak_pokedex: {oak_pokedex} all_events_score: {all_events_score}')
         '''
-        
+        poke_xps = [self.read_triple(a) for a in [0xD179, 0xD1A5, 0xD1D1, 0xD1FD, 0xD229, 0xD255]]
+
+        enemy_hp = self.read_hp(ENEMY_HP_ADDRESS)
+        enemy_max_hp = self.read_hp(ENEMY_MAX_HP_ADDRESS)
+        enemy_hp_loss = abs(enemy_max_hp-enemy_hp)/ enemy_max_hp if enemy_max_hp > 0 else 0
+        player_hp = self.read_hp(PLAYER_HP_ADDRESS)
+        player_max_hp = self.read_hp(PLAYER_MAX_HP_ADDRESS)
+        player_hp_loss = abs(player_max_hp-player_hp)/ player_max_hp if player_max_hp > 0 else 0
+        battle_advantage = enemy_hp_loss - player_hp_loss
+
         state_scores = {
             'event': self.reward_scale*self.update_max_event_rew(),  
-            #'party_xp': self.reward_scale*0.1*sum(poke_xps),
+            'party_xp': self.reward_scale*0.001*sum(poke_xps),
             'level': self.reward_scale*self.get_levels_reward(), 
             'heal': self.reward_scale*self.total_healing_rew,
             'op_lvl': self.reward_scale*self.update_max_op_level(),
-            'dead': self.reward_scale*-0.1*self.died_count,
-            'badge': self.reward_scale*self.get_badges() * 5,
+            #'dead': self.reward_scale*-0.1*self.died_count,
+            'badge': self.reward_scale*self.get_badges() * 100,
             #'op_poke': self.reward_scale*self.max_opponent_poke * 800,
             #'money': self.reward_scale* money * 3,
             #'seen_poke': self.reward_scale * seen_poke_count * 400,
-            'explore': self.reward_scale * self.get_knn_reward()
+            'explore': self.reward_scale * self.get_knn_reward(),
+            'battle_adv': self.reward_scale * battle_advantage*0.1,
         }
         
         return state_scores
@@ -623,3 +658,21 @@ class RedGymEnv(Env):
         else:
             return "Unknown Location"
     
+class BattleReward(NamedTuple):
+    enemy_hp_loss_sum: int
+    player_hp_loss_sum: int
+    reward: float
+
+class ExplorationReward(NamedTuple):
+    pass
+
+class RAMapAdressesReadTool:
+    def __init__(self,start_add,count):
+        self.start_add = start_add
+        self.count = count
+    
+    def read_data(self):
+        data = 0
+        for i in range(count):
+            data += self.read_m(self.start_add + i) * (256 ** (self.count - i - 1))
+        return data
